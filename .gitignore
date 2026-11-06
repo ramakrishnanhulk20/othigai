@@ -1,0 +1,25 @@
+# Private planning files
+CLAUDE.md
+INTAKE.md
+PLAN.md
+STATE.md
+DECISIONS.md
+AGENT-RETROS.md
+SPEC.md
+docs/RD-BRIEF.md
+docs/AUDIT-PACKET.md
+reference/
+scratchpad/
+.claude/
+
+# Secrets
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+.ruff_cache/
