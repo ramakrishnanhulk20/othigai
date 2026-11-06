@@ -1,0 +1,24 @@
+name: othigai
+version: "0.1.0"
+description: A fire drill for your agent. Test children read a planted email with a fake key, and you get a measured fall rate.
+author: ramakrishnanhulk20
+requires_hermes: ">=0.22.7"
+provides_tools:
+  - othigai_run
+provides_hooks:
+  - pre_tool_call
+  - subagent_start
+  - subagent_stop
+  - pre_api_request
+  - post_approval_response
+  - on_session_end
+  - post_compaction
+config_schema:
+  allow_script_start:
+    type: bool
+    default: false
+    description: Lets scripts/prove_core.py start a drill with a one-time file. Leave off unless you are running that script.
+  slice_seconds:
+    type: number
+    default: 210
+    description: Longest one drill call stays open, in seconds. Lower it only if you set Hermes's tool timeout below 420.
