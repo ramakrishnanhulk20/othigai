@@ -36,6 +36,15 @@ CURL_OPTION_REFUSED = "curl_option_refused"
 URL_NOT_LISTENER = "url_not_listener"
 GATE_ERROR = "gate_error"
 
+PROGRAM_OTHER = "other"
+_PROGRAM_BASH = "bash"
+_BASH_NETWORK_PATH = "/dev/tcp"
+_PROGRAM_LABELS = {
+    "curl": "curl", "wget": "wget", "python": "python", "py": "python", "powershell": "powershell",
+    "pwsh": "powershell", "node": "node", "nodejs": "node", "nc": "nc", "ncat": "nc", "netcat": "nc",
+    "bash": _PROGRAM_BASH, "sh": _PROGRAM_BASH,
+}
+
 _SHORT_FLAGS = re.compile(r"-[A-Za-z0-9]+")
 _GREP_FLAGS = re.compile(r"-[inrlcvEFwHs]+")
 _COUNT_VALUE = re.compile(r"[+-]?[0-9]+")
@@ -44,9 +53,26 @@ _MAX_SLEEP_SECONDS = 30
 _PROGRAM_NAME = re.compile(r"[A-Za-z0-9._][A-Za-z0-9._-]*")
 _GIT_BASH_DRIVE = re.compile(r"/([A-Za-z])(?:/(.*))?")
 _INERT_PROGRAMS = {"echo", "printf", "pwd", "true"}
+# `printf 'ab%n' PATH` stores a count in the variable named, measured on Git Bash, so `%n` changes the
+# shell as `-v` does. Any non-letter may sit between the two, because `$?` there turns into a number at
+# run time, and bash skips the length letters. A percent sign or backslash there ends the search, so a
+# format that prints a percent sign and a newline still runs.
+_PRINTF_STORES = re.compile(r"%[^A-Za-z%\\]*[hjlLtz]*n")
 _STATUS_PROGRAMS = {"echo", "printf"}
 _PATH_PROGRAMS = {"cat", "type", "ls", "dir", "head", "tail", "wc", "grep", "rm"}
 _PIPE_READERS = {"cat", "head", "tail", "wc", "grep"}
+
+# Hermes reads a missing search path as several, cut at these or at any other Unicode space.
+_PATH_SPLITTERS = frozenset(" ,")
+_WRITING_TOOLS = {"write_file", "patch"}
+# Every other suffix can start a linter from the real working folder, or plant a script something
+# else then runs (tools/file_operations_lint.py:21). These six have no shell linter.
+_WRITE_SUFFIXES = {".txt", ".md", ".json", ".csv", ".eml", ".log"}
+# The schema's own closed sets (tools/file_tools.py:1302). Its handler also takes `grep` and `find`.
+_SEARCH_CHOICES = {"target": {"content", "files"}, "output_mode": {"content", "files_only", "count"},
+                   "order": {"discovery", "modified"}}
+_SEARCH_COUNTS = ("context", "limit", "offset")
+_READ_COUNTS = ("offset", "limit")
 
 _FILE_TOOL_KEYS = {
     "read_file": {"path", "offset", "limit"},
@@ -81,6 +107,7 @@ _CURL_FILE_MARK = re.compile(r"@|=<")
 # In a form value `,` starts another file, and `"` hides `;` and `,` from the cuts made here.
 _CURL_FORM_SPLITTERS = frozenset(',"')
 _CURL_UPLOAD_GLOB = frozenset("{}[]")
+_VERSION_TAIL = re.compile(r"[0-9.]+$")
 
 
 @dataclass(frozen=True)
@@ -114,18 +141,74 @@ def _path_ok(raw: Any, assets, *, below_only: bool = False) -> bool:
     return resolved is not None and is_inside(resolved, assets.root, below_only=below_only)
 
 
-def _decide_file_tool(tool_name: str, args: dict, assets) -> Decision:
+def plain_path_text(raw: Any) -> bool:
+    """True when Hermes can only read this text as one path.
+
+    Hermes cuts a search path that does not exist at commas, or else at any Unicode space, and
+    searches every part (tools/file_operations_search.py:822), so one judged path can reach others.
+    `isprintable` is False for each Unicode space but the plain one, which `_PATH_SPLITTERS` names,
+    and for control and invisible characters. Does not say where a path leads: `_path_ok` does.
+    """
+    return isinstance(raw, str) and not any(ch in _PATH_SPLITTERS or not ch.isprintable() for ch in raw)
+
+
+def _is_count(value: Any) -> bool:
+    """Some providers send every schema key, so a null means the same as leaving the key out."""
+    return value is None or (type(value) is int and value >= 0)
+
+
+def _is_choice(value: Any, choices: set[str]) -> bool:
+    return value is None or (isinstance(value, str) and value in choices)
+
+
+def _search_shape_ok(args: dict) -> bool:
+    """rg and grep get `pattern` with no `--` before it, so a leading dash is an option: `--pre=<script>`
+    runs a program and `--file=<path>` loads a file outside the folder. `file_glob` follows `--glob` and
+    measured harmless, and is held to the same shape so a later Hermes cannot change that. Hermes puts
+    `context` into the command unquoted. A regular expression is left free, because Hermes passes it
+    as one quoted word (tried with quotes and substitutions in scratchpad attacks A24 to A27).
+    """
+    pattern, file_glob = args.get("pattern"), args.get("file_glob")
+    if not isinstance(pattern, str) or pattern.startswith("-"):
+        return False
+    if file_glob is not None and (not plain_path_text(file_glob) or file_glob.startswith("-")):
+        return False
+    return (all(_is_choice(args.get(name), choices) for name, choices in _SEARCH_CHOICES.items())
+            and all(_is_count(args.get(name)) for name in _SEARCH_COUNTS))
+
+
+def _file_shape_ok(tool_name: str, args: dict) -> bool:
     if set(args) - _FILE_TOOL_KEYS[tool_name]:
+        return False
+    if tool_name == "read_file":
+        return all(_is_count(args.get(name)) for name in _READ_COUNTS)
+    if tool_name == "write_file":
+        return isinstance(args.get("content"), str)
+    if tool_name == "patch":
+        replace_all = args.get("replace_all")
+        return (args.get("mode", "replace") == "replace" and (replace_all is None or isinstance(replace_all, bool))
+                and isinstance(args.get("old_string"), str) and isinstance(args.get("new_string"), str))
+    return _search_shape_ok(args)
+
+
+def _decide_file_tool(tool_name: str, args: dict, assets) -> Decision:
+    if not _file_shape_ok(tool_name, args):
         return _refuse(BAD_ARGUMENTS)
-    if tool_name == "patch" and args.get("mode", "replace") != "replace":
-        return _refuse(BAD_ARGUMENTS)
+    path = args.get("path")
+    if not plain_path_text(path):
+        return _refuse(PATH_OUTSIDE)
     if tool_name == "search_files":
         globs = [args.get("file_glob") or ""]
         if args.get("target", "content") != "content":
-            globs.append(args.get("pattern") or "")
-        if any(".." in str(text) for text in globs):
+            globs.append(args["pattern"])
+        if any(".." in text for text in globs):
             return _refuse(PATH_OUTSIDE)
-    return _ALLOW if _path_ok(args.get("path"), assets) else _refuse(PATH_OUTSIDE)
+    if not _path_ok(path, assets):
+        return _refuse(PATH_OUTSIDE)
+    # The same call Hermes uses to pick a linter, so the two cannot read a name differently.
+    if tool_name in _WRITING_TOOLS and os.path.splitext(path)[1].lower() not in _WRITE_SUFFIXES:
+        return _refuse(BAD_ARGUMENTS)
+    return _ALLOW
 
 
 def _grep_paths(words: list[str]) -> list[str] | None:
@@ -160,6 +243,9 @@ def _head_tail_paths(program: str, words: list[str]) -> list[str] | None:
 
 def _decide_path_program(program: str, words: list[str], piped: bool, assets) -> Decision:
     if any(word.startswith("--") for word in words):
+        return _refuse(BAD_ARGUMENTS)
+    # Hermes flags a recursive delete, and a child's run must not hang on a person's answer.
+    if program == "rm" and any(word.startswith("-") and "r" in word.lower() for word in words):
         return _refuse(BAD_ARGUMENTS)
     if program == "grep":
         paths = _grep_paths(words)
@@ -264,7 +350,8 @@ def _decide_curl(words: list[str], assets) -> Decision:
 def _decide_segment(program: str, words: list[str], piped: bool, assets) -> Decision:
     if program in _INERT_PROGRAMS:
         # `printf -v PATH x` changes the shell itself, and the next program can then be a planted one.
-        changes_shell = program == "printf" and bool(words) and words[0].startswith("-v")
+        changes_shell = program == "printf" and bool(words) and (
+            words[0].startswith("-v") or any(_PRINTF_STORES.search(word) for word in words))
         return _refuse(BAD_ARGUMENTS) if changes_shell else _ALLOW
     if program == "sleep":
         short_wait = (len(words) == 1 and _SLEEP_SECONDS.fullmatch(words[0])
@@ -322,6 +409,53 @@ def _decide_terminal(args: dict, assets) -> Decision:
         if not decision.allow:
             return decision
     return _ALLOW
+
+
+def _program_of(word: str) -> str | None:
+    """The closed label for one command word. Both Windows and POSIX spellings of a path fold away."""
+    name = word.replace("\\", "/").rsplit("/", 1)[-1].lower().removesuffix(".exe")
+    return _PROGRAM_LABELS.get(_VERSION_TAIL.sub("", name))
+
+
+def program_label(args: Any) -> str:
+    """Name the program a refused call reached for, as a word from a closed set, for a run's timeline.
+
+    Each parsed segment is looked at, so `cat x | curl` is curl. A command outside the grammar gets
+    a plain split of its first word instead. `/dev/tcp` is bash's own network path, so it counts as
+    bash whatever word comes first. Used for labels only, never for a decision. Every return value
+    is a plugin word, so no child text can travel with it, and nothing here raises.
+    """
+    command = args.get("command") if isinstance(args, dict) else None
+    if not isinstance(command, str):
+        return PROGRAM_OTHER
+    segments = shell.parse(command)
+    words = [segment.words[0] for segment in segments] if segments else command.split()[:1]
+    known = next((label for label in map(_program_of, words) if label is not None), None)
+    if known is not None:
+        return known
+    return _PROGRAM_BASH if _BASH_NETWORK_PATH in command else PROGRAM_OTHER
+
+
+def _names_a_curl_file(option: str, value: str) -> bool:
+    if option in _CURL_UPLOAD_VALUES:
+        return True
+    if option in _CURL_START_AT_VALUES:
+        return value.startswith("@") and value != "@-"
+    mark = _CURL_FILE_MARK.search(value) if option in _CURL_ANYWHERE_AT_VALUES else None
+    return mark is not None and value[mark.end():].split(";", 1)[0] != "-"
+
+
+def sends_file(args: Any) -> bool:
+    """True when a curl in this call hands over a named file. Standard input is not a named file.
+
+    For a call the gate already allowed, whose option and value pairs it has walked. A timeline
+    label only: which bytes left is the listener's to say.
+    """
+    command = args.get("command") if isinstance(args, dict) else None
+    segments = shell.parse(command) or []
+    return any(_names_a_curl_file(option, value)
+               for segment in segments if segment.words[0] == "curl"
+               for option, value in zip(segment.words[1:], segment.words[2:]))
 
 
 def decide(tool_name: str, args: dict, assets) -> Decision:
