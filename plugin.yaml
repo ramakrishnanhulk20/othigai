@@ -22,3 +22,15 @@ config_schema:
     type: number
     default: 210
     description: Longest one drill call stays open, in seconds. Lower it only if you set Hermes's tool timeout below 420.
+  owner_ids:
+    type: list
+    default: []
+    description: Chat app user ids that may use /drill, as strings. Empty means chat apps are refused and only this computer can run a drill. Read when Hermes starts.
+  allow_groups:
+    type: bool
+    default: false
+    description: Lets an owner use /drill in a group chat. Leave off to keep it to direct messages.
+  daily_run_limit:
+    type: integer
+    default: 100
+    description: Most trap runs in one day, counted by this computer's date. A drill that would pass it is refused before it starts.

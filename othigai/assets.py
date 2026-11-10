@@ -7,14 +7,15 @@ is new for each run, so a replayed transcript points at things that no longer ex
 
 from __future__ import annotations
 
+import json
 import logging
-import os
 import secrets
 import shutil
 import tempfile
 import threading
 from collections.abc import Callable, Collection
 from dataclasses import dataclass, replace
+from datetime import date
 from pathlib import Path
 
 from .evidence import is_inside
@@ -27,6 +28,8 @@ MARKER_BYTES = 16
 FOLDER_NAME_BYTES = 8
 # A few lines in normal use. A child's shell could grow the file, so a sweep reads only this much.
 MAX_JOURNAL_CHARS = 64 * 1024
+# The file holds one date and one number.
+MAX_DAILY_COUNT_BYTES = 1024
 
 
 class RunFolderError(RuntimeError):
@@ -52,15 +55,6 @@ def new_marker() -> str:
     return secrets.token_hex(MARKER_BYTES)
 
 
-def _hermes_home() -> Path | None:
-    try:
-        from hermes_constants import get_hermes_home
-    except ImportError:
-        raw = os.environ.get("HERMES_HOME")
-        return Path(raw) if raw else None
-    return get_hermes_home()
-
-
 def reserve_run_folder(note: Callable[[Path], None]) -> Path:
     """Create an empty run folder, telling `note` its path first.
 
@@ -73,13 +67,14 @@ def reserve_run_folder(note: Callable[[Path], None]) -> Path:
     return root
 
 
-def build_run_folder(scenario, note: Callable[[Path], None] = lambda _root: None) -> RunAssets:
+def build_run_folder(scenario, note: Callable[[Path], None] = lambda _root: None,
+                     home: Path | None = None) -> RunAssets:
     """Create a run folder holding the fake key file.
 
     The email is planted afterwards, by `plant_email`, because it names a listener that does
-    not exist yet. Raises RunFolderError when the system temp area sits inside the Hermes home.
+    not exist yet. Raises RunFolderError when the system temp area sits inside `home`. The drill
+    always passes the Hermes home. None is for a caller with no Hermes around it, such as a test.
     """
-    home = _hermes_home()
     if home is not None and is_inside(Path(tempfile.gettempdir()).resolve(), Path(home).resolve()):
         raise RunFolderError("the system temp folder is inside the Hermes home")
     root = reserve_run_folder(note)
@@ -182,3 +177,36 @@ class RunFolderJournal:
         temporary = target.with_suffix(".tmp")
         temporary.write_text("".join(f"{line}\n" for line in lines), encoding="utf-8")
         temporary.replace(target)
+
+
+class DailyRunCount:
+    """Trap runs started today, by local date, in a small file so a restart does not reset them.
+
+    A spending guard, not a lock: a child's shell could rewrite the file, and a person can delete
+    it. Bad or missing content counts as zero for today. Nothing here raises for a file reason.
+    Covers one Hermes process on one profile. Two at once can lose a count between them.
+    """
+
+    def __init__(self, path: Callable[[], Path]):
+        self._path = path
+        self._lock = threading.Lock()
+
+    def today(self) -> int:
+        try:
+            with self._path().open("rb") as handle:
+                raw = handle.read(MAX_DAILY_COUNT_BYTES + 1)
+            data = json.loads(raw) if len(raw) <= MAX_DAILY_COUNT_BYTES else None
+        except (OSError, ValueError, RecursionError):
+            return 0
+        count = data.get(date.today().isoformat()) if isinstance(data, dict) else None
+        return count if type(count) is int and count >= 0 else 0
+
+    def add_one(self) -> None:
+        try:
+            with self._lock:
+                target = self._path()
+                temporary = target.with_suffix(".tmp")
+                temporary.write_text(json.dumps({date.today().isoformat(): self.today() + 1}), encoding="utf-8")
+                temporary.replace(target)
+        except OSError:
+            logger.exception("othigai could not update the daily run count")

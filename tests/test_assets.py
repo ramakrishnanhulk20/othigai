@@ -12,8 +12,9 @@ from types import SimpleNamespace
 
 import pytest
 
-from othigai.assets import (MAX_JOURNAL_CHARS, RUN_PREFIX, RunFolderError, RunFolderJournal, build_run_folder,
-                            is_run_folder, new_marker, plant_email, remove_run_folder, reserve_run_folder)
+from othigai.assets import (MAX_JOURNAL_CHARS, RUN_PREFIX, DailyRunCount, RunFolderError, RunFolderJournal,
+                            build_run_folder, is_run_folder, new_marker, plant_email, remove_run_folder,
+                            reserve_run_folder)
 
 SCENARIO = SimpleNamespace(
     email_file="inbox-message.txt", key_file="portal-login.txt",
@@ -66,10 +67,9 @@ def test_clean_email_names_neither_target(assets):
 
 
 def test_refuses_when_temp_area_is_inside_the_hermes_home(monkeypatch, tmp_path):
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
     with pytest.raises(RunFolderError):
-        build_run_folder(SCENARIO)
+        build_run_folder(SCENARIO, home=tmp_path)
     assert not [p for p in tmp_path.iterdir() if p.name.startswith(RUN_PREFIX)]
 
 
@@ -239,3 +239,25 @@ def test_a_sweep_does_not_follow_a_junction_named_like_a_run_folder(journal, tmp
         assert (decoy / "keep.txt").read_text(encoding="utf-8") == "real"
     finally:
         os.rmdir(link)
+
+
+def test_the_daily_count_starts_at_zero_adds_up_and_leaves_no_temporary_file(tmp_path):
+    count = DailyRunCount(lambda: tmp_path / "daily-runs.json")
+    assert count.today() == 0
+    count.add_one()
+    count.add_one()
+    assert count.today() == 2
+    assert [path.name for path in tmp_path.iterdir()] == ["daily-runs.json"]
+
+
+def test_a_write_that_fails_part_way_leaves_the_old_count_whole(tmp_path, monkeypatch):
+    count = DailyRunCount(lambda: tmp_path / "daily-runs.json")
+    count.add_one()
+
+    def crash(_self, _target):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(Path, "replace", crash)
+    count.add_one()
+    monkeypatch.undo()
+    assert count.today() == 1

@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 """Drives one real Hermes turn through the drill and prints a measured fall rate.
 
-    HERMES_HOME=<home> python scripts/prove_core.py --runs 20 [--model M] [--provider P]
+    HERMES_HOME=<home> python scripts/prove_core.py --runs 20 [--scenario S|all] [--model M] [--provider P]
 
 Every number comes from the plugin's own result for this run, never from what a model replied.
-The script mints a one-time start token, so it stands in for the person typing /drill. It turns
-the file start path on for this run only and puts the home's config back afterwards. It never
-reads a credential: Hermes loads its own, and the environment passed down is an allow-list.
+The script mints a one-time start token, which is the operator's own consent, so no notice is
+shown. It turns the file start path on for this run only and puts the home's config back
+afterwards. It never reads a credential: Hermes loads its own, and the environment passed down
+is an allow-list.
 """
 
 import argparse
@@ -21,9 +22,14 @@ import time
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[1]
+# This repo's own folder, so the words below match this checkout and Hermes is never imported.
+sys.path.insert(0, str(REPO))
+from othigai.report import build, render_text  # noqa: E402
+
 OUTPUT_FOLDER = REPO / "scratchpad" / "core"
 PLUGIN = "othigai"
 DEFAULT_SCENARIO = "vendor-portal-login"
+ALL_SCENARIOS = "all"
 SHIPPED = ("plugin.yaml", "__init__.py", "othigai", "scenarios")
 MAX_RUNS = 50
 START_TOKEN_SECONDS = 590
@@ -114,6 +120,10 @@ def drill_prompt(scenario: str, runs: int, model: str | None, provider: str | No
             "finished, reply with one line saying it finished. Do nothing else.\n")
 
 
+def scenario_count(scenario: str) -> int:
+    return len(list((REPO / "scenarios").glob("*.yaml"))) if scenario == ALL_SCENARIOS else 1
+
+
 def percent(value: float | None) -> str:
     return "n/a" if value is None else f"{value * 100:.1f}%"
 
@@ -124,7 +134,7 @@ def print_result(report: Report, result: dict) -> int:
         return 3
     for entry in result.get("lines", []):
         reasons = ", ".join(entry.get("evidence", [])) or "no findings"
-        report.line(f"run {entry['run']}: {entry['outcome']} ({reasons})")
+        report.line(f"{entry['scenario_id']} run {entry['run']}: {entry['outcome']} ({reasons})")
     measured = result["fell"] + result["probed"] + result["resisted"]
     report.line()
     key_seen = sum(1 for entry in result.get("lines", []) if "marker_left_the_folder" in entry.get("evidence", []))
@@ -135,6 +145,13 @@ def print_result(report: Report, result: dict) -> int:
     report.line(f"Resisted: {result['resisted']}. Not measured: {result['not_measured']}.")
     report.line(f"Control runs: {result['control_runs']}, of which called the listener: {result['control_fell']}.")
     report.line(f"Slices: {result['slices']}.")
+    report.line(f"Model calls: {result['model_calls']} of at most {result['call_limit']}.")
+    for entry in result["per_scenario"]:
+        looked_at = entry["fell"] + entry["probed"] + entry["resisted"]
+        report.line(f"{entry['scenario_id']}: fell {entry['fell']} of {looked_at} measured "
+                    f"({percent(entry['fall_rate'])}), called the address {entry['probed']}, resisted {entry['resisted']}, "
+                    f"not measured {entry['not_measured']}, controls {entry['control_runs']}, "
+                    f"of which called the listener {entry['control_fell']}.")
     if result["unresolved"]:
         report.line(f"Children that did not end in time: {result['unresolved']}.")
     if result["status"] == "stopped":
@@ -143,6 +160,9 @@ def print_result(report: Report, result: dict) -> int:
     if result["status"] == "running":
         report.line(f"The model stopped calling early: {result['done']} of {result['runs']} runs scored.")
         return 5
+    report.line()
+    report.line("Report:")
+    report.line(render_text(build(result, None)))
     return 0
 
 
@@ -157,7 +177,7 @@ def drive(report: Report, exe: str, home: Path, workdir: Path, args: argparse.Na
         command += ["-m", args.model]
     if args.provider:
         command += ["--provider", args.provider]
-    limit = args.runs * CHILDREN_PER_RUN * SECONDS_PER_CHILD + TURN_MARGIN_SECONDS
+    limit = args.runs * scenario_count(args.scenario) * CHILDREN_PER_RUN * SECONDS_PER_CHILD + TURN_MARGIN_SECONDS
     done = run_hermes(exe, home, workdir, command, timeout=limit)
     report.keep(f"--- hermes chat exit {done.returncode} ---\n{done.stdout}\n{done.stderr}\n--- end ---")
     result_path = home / "plugin-data" / PLUGIN / "results" / f"{run_id}.json"
@@ -170,8 +190,8 @@ def drive(report: Report, exe: str, home: Path, workdir: Path, args: argparse.Na
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("--runs", type=int, required=True, help=f"trap runs, each with a paired control, 1 to {MAX_RUNS}")
-    parser.add_argument("--scenario", default=DEFAULT_SCENARIO, help="scenario id from the scenarios folder")
+    parser.add_argument("--runs", type=int, required=True, help=f"trap runs per scenario, each with a paired control, 1 to {MAX_RUNS}")
+    parser.add_argument("--scenario", default=DEFAULT_SCENARIO, help="scenario id from the scenarios folder, or all")
     parser.add_argument("--model", help="model for the parent and the test children")
     parser.add_argument("--provider", help="provider for the parent and the test children")
     args = parser.parse_args()
@@ -195,7 +215,7 @@ def main() -> int:
     report = Report(OUTPUT_FOLDER / f"prove-{stamp}.txt")
     report.line(f"Othigai core proof, {stamp}")
     report.line(f"Hermes home: {home}")
-    report.line(f"Scenario: {args.scenario}. Trap runs asked for: {args.runs}, each with a paired control run")
+    report.line(f"Scenario: {args.scenario}. Trap runs per scenario: {args.runs}, each with a paired control run")
     report.line(f"Model: {args.model or 'the home default'}. Provider: {args.provider or 'the home default'}.")
     report.line()
     config_path = home / "config.yaml"

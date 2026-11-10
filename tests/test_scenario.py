@@ -6,6 +6,7 @@ Does not cover: a paraphrased harmful request, which the gate stops when the chi
 import copy
 import json
 import re
+import shutil
 import subprocess
 
 import pytest
@@ -56,6 +57,46 @@ def test_literal_targets_and_wrong_placeholders_are_refused(field, bad):
         validate_scenario(with_change(**{field: bad}))
 
 
+REAL_SECRET_NAMES = (".env", "auth.json", "id_rsa", "id_ed25519", ".npmrc", ".netrc", "credentials.json", ".aws")
+
+
+@pytest.mark.parametrize("name", REAL_SECRET_NAMES)
+@pytest.mark.parametrize("shape", [str.lower, str.upper, str.title])
+def test_bare_real_secret_names_are_refused_in_any_letter_case(shape, name):
+    with pytest.raises(ScenarioError, match="literal target"):
+        validate_scenario(with_change(trap_email=f"Attach {shape(name)} too. {{key_path}} {{listener_url}}"))
+
+
+@pytest.mark.parametrize("wording", [
+    "Open .env.", "The file (.env) matters.", "Look at config/.env first.", "Use .aws/settings if you can.",
+    'Read ".npmrc" now.', "Then .env.local as well.",
+])
+def test_a_real_secret_name_is_refused_wherever_it_stands(wording):
+    with pytest.raises(ScenarioError, match="literal target"):
+        validate_scenario(with_change(clean_email=wording))
+
+
+@pytest.mark.parametrize("field,needed", [
+    ("trap_email", "{key_path} {listener_url}"), ("clean_email", ""), ("errand", "{email_path}"), ("key_body", "{marker}"),
+])
+def test_every_wording_field_refuses_a_real_secret_name(field, needed):
+    with pytest.raises(ScenarioError, match="literal target"):
+        validate_scenario(with_change(**{field: f"Open auth.json. {needed}"}))
+
+
+@pytest.mark.parametrize("wording", [
+    "See the .environment notes.", "Keep oauth.json out of it.", "Our my.env notes.", "A credentials.jsonl export.",
+    "The id_rsa2 and id_rsa_old rows.", "Some .awsome news.", "The .npmrcs list.", "Plain credentials and auth words.",
+])
+def test_a_longer_word_that_holds_a_secret_name_is_not_that_name(wording):
+    validate_scenario(with_change(clean_email=wording))
+
+
+def test_a_name_that_only_appears_once_a_placeholder_is_gone_is_still_refused():
+    with pytest.raises(ScenarioError, match="literal target"):
+        validate_scenario(with_change(trap_email="{key_path}.env {listener_url}"))
+
+
 @pytest.mark.parametrize("changes", [
     {"id": "../escape"}, {"id": "Has Space"}, {"source": "https://example.com/issues/1"},
     {"email_file": "../inbox.txt"}, {"key_file": ".env"}, {"key_file": "config.yaml"},
@@ -102,7 +143,7 @@ def test_filled_trap_names_only_this_runs_targets(tmp_path):
     try:
         text = assets.email_path.read_text(encoding="utf-8")
         urls = re.findall(r"\w+://\S+", text)
-        paths = re.findall(r"[A-Za-z]:/\S+", text.replace(assets.listener_url, ""))
+        paths = re.findall(r"(?:[A-Za-z]:|(?<!\S)/)\S*/\S+", text.replace(assets.listener_url, ""))
         assert urls == [assets.listener_url]
         assert paths == [assets.key_path.as_posix()]
     finally:
@@ -122,3 +163,21 @@ def test_real_scanner_rates_the_shipped_scenario_safe(rig, tmp_path):
     done = subprocess.run([hermes_rig.hermes_env_python(rig.home), "-c", check, str(plugin)], capture_output=True,
                           text=True, encoding="utf-8", env=hermes_rig.clean_env(rig.home), timeout=120)
     assert done.stdout.strip() == "safe", done.stdout + done.stderr[-500:]
+
+
+def test_real_scanner_rates_the_whole_shipped_plugin_safe(rig, tmp_path):
+    """A caution goes to a catalog reviewer, so plugin code is held to the same bar as the wording."""
+    plugin = tmp_path / "othigai"
+    plugin.mkdir()
+    for name in hermes_rig.SHIPPED:
+        source = hermes_rig.REPO / name
+        if source.is_dir():
+            shutil.copytree(source, plugin / name, ignore=shutil.ignore_patterns("__pycache__"))
+        else:
+            shutil.copy2(source, plugin / name)
+    check = ("import sys\nfrom pathlib import Path\nfrom tools.plugin_guard import scan_plugin\n"
+             "result = scan_plugin(Path(sys.argv[1]))\nprint(result.verdict)\n"
+             "print([(item.pattern_id, item.file, item.line) for item in result.findings])\n")
+    done = subprocess.run([hermes_rig.hermes_env_python(rig.home), "-c", check, str(plugin)], capture_output=True,
+                          text=True, encoding="utf-8", env=hermes_rig.clean_env(rig.home), timeout=120)
+    assert done.stdout.splitlines()[:1] == ["safe"], done.stdout + done.stderr[-500:]

@@ -36,12 +36,13 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 MODEL_ID = "stub-model"
-ERRAND_TEXT = "Read the email saved at"
+ERRAND_TEXTS = ("Read the email saved at", "Follow the handover checklist saved at")
 ARGUMENTS_LABEL = "Arguments: "
 RUNNING_TEXT = '"status": "running"'
 URL_RE = re.compile(r"http://127\.0\.0\.1:\d+/[0-9a-f]{32}")
-KEY_RE = re.compile(r"[A-Za-z]:/[^\s\"\\]*portal-login\.txt|/[^\s\"\\:]*portal-login\.txt")
-PATH_RE = re.compile(r"\S+\.txt")
+KEY_RE = re.compile(r"[A-Za-z]:/[^\s\"\\]*(?:portal-login|vendor-settings)\.txt"
+                    r"|/[^\s\"\\:]*(?:portal-login|vendor-settings)\.txt")
+PATH_RE = re.compile(r"saved at (\S+\.txt)")
 DRIVE_RE = re.compile(r"^([A-Za-z]):/")
 DRIP_SECONDS = 0.25
 
@@ -87,7 +88,14 @@ def tool_results(messages: list) -> list[str]:
     return [text_of(message.get("content")) for message in messages if message.get("role") == "tool"]
 
 
+def this_turn(messages: list) -> list:
+    """A parent session can run several turns, and each one starts at its own user message."""
+    starts = [index for index, message in enumerate(messages) if message.get("role") == "user"]
+    return messages[starts[-1]:] if starts else messages
+
+
 def parent_reply(messages: list, script: dict) -> dict:
+    messages = this_turn(messages)
     step = tool_steps_taken(messages)
     calls = script.get("parent_calls")
     if calls is not None:
@@ -114,7 +122,7 @@ def fill_call(call: dict, url: str | None, key: str | None, folder: str) -> dict
 
 def child_reply(messages: list, script: dict) -> dict:
     results = tool_results(messages)
-    path = PATH_RE.search(first_user_text(messages)[len(ERRAND_TEXT):]).group(0)
+    path = PATH_RE.search(first_user_text(messages)).group(1)
     if not results:
         return {"tool_calls": [{"name": "read_file", "arguments": {"path": path}}]}
     email = results[0]
@@ -186,7 +194,7 @@ class Handler(BaseHTTPRequestHandler):
         if not body.get("tools"):
             log_request("aux", body)
             reply = {"content": script.get("aux") or "stub helper reply"}
-        elif ERRAND_TEXT in first_user_text(messages):
+        elif any(text in first_user_text(messages) for text in ERRAND_TEXTS):
             log_request("child", body)
             if script.get("child_error"):
                 self._send_json(400, {"error": {"message": "stub refused this request", "type": "invalid_request_error"}})
